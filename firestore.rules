@@ -1,0 +1,204 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+    function signedIn() { return request.auth != null; }
+    function isOwner(userId) { return signedIn() && request.auth.uid == userId; }
+
+    // Verify a field is unchanged during an update (handles field not existing yet)
+    function fieldUnchanged(fieldName) {
+      return (!(fieldName in resource.data) && !(fieldName in request.resource.data))
+        || (fieldName in resource.data && request.resource.data[fieldName] == resource.data[fieldName]);
+    }
+
+    // Generator-confirmed fields must be untouched during company writes
+    function generatorUnchanged() {
+      return fieldUnchanged('generatorConfirmedWeight') && fieldUnchanged('generatorConfirmedPhotos');
+    }
+
+    // Company-confirmed fields must be untouched during generator writes
+    function companyUnchanged() {
+      return fieldUnchanged('companyConfirmedWeight') && fieldUnchanged('companyConfirmedPhotos');
+    }
+
+    // Ensures only a specific set of fields are modified
+    function onlyChanged(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    // Weight confirmation tolerance check (<15% deviation, using integer math to avoid float issues)
+    function checkTolerance(genWeight, compWeight) {
+      let diff = genWeight - compWeight;
+      let absDiff = diff < 0 ? -diff : diff;
+      let sum = genWeight + compWeight;
+      return absDiff * 200 <= 15 * sum;
+    }
+
+    // Safely reads a category weight from the stats map, defaulting to 0.0 if absent
+    function getCategoryWeight(statsMap, category) {
+      return category in statsMap ? statsMap[category] : 0.0;
+    }
+
+    // Verifies the referenced transaction is transitioning confirmed in this batch write
+    function txTransitionedToConfirmed(txId) {
+      let txPost = getAfter(/databases/$(database)/documents/transactions/$(txId));
+      let txPre  = get(/databases/$(database)/documents/transactions/$(txId));
+      return txPre.data.status == 'pendingConfirmation'
+        && txPost.data.status == 'confirmed'
+        && request.resource.data.totalKgRecycled == resource.data.totalKgRecycled + txPost.data.finalWeightKg
+        && request.resource.data.totalTransactions == resource.data.totalTransactions + 1
+        && request.resource.data.byCategory[txPost.data.category] ==
+           getCategoryWeight(resource.data.byCategory, txPost.data.category) + txPost.data.finalWeightKg;
+    }
+
+    function isValidStatsIncrement(id) {
+      return id == 'global'
+        && request.resource.data.lastConfirmedTransactionId != null
+        && txTransitionedToConfirmed(request.resource.data.lastConfirmedTransactionId);
+    }
+
+    // Core immutable transaction fields
+    function txCoreUnchanged() {
+      return fieldUnchanged('matchId')
+        && fieldUnchanged('generatorId')
+        && fieldUnchanged('companyId')
+        && fieldUnchanged('finalWeightKg')
+        && fieldUnchanged('agreedPrice');
+    }
+
+    // ─── /users ───────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create: if isOwner(userId)
+        && request.resource.data.role in ['generator', 'company']
+        && request.resource.data.trustScore == 100
+        && request.resource.data.isVerified == false;
+      allow update: if isOwner(userId)
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.trustScore == resource.data.trustScore
+        && request.resource.data.isVerified == resource.data.isVerified;
+    }
+
+    // ─── /generatorProfiles ───────────────────────────────────────────────────
+    match /generatorProfiles/{userId} {
+      allow read: if signedIn();
+      allow write: if isOwner(userId);
+    }
+
+    // ─── /companyProfiles ─────────────────────────────────────────────────────
+    match /companyProfiles/{userId} {
+      allow read: if signedIn();
+      allow create: if isOwner(userId)
+        && request.resource.data.isApproved == true
+        && request.resource.data.companyName != null
+        && request.resource.data.acceptedCategories.size() > 0;
+      // isApproved is permanently locked — cannot be flipped back to true
+      allow update: if isOwner(userId)
+        && request.resource.data.isApproved == resource.data.isApproved;
+    }
+
+    // ─── /wasteOffers ─────────────────────────────────────────────────────────
+    match /wasteOffers/{offerId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.generatorId == request.auth.uid
+        && request.resource.data.status == 'open';
+
+      allow update: if signedIn() && (
+        // Generator owns and can edit open offer or cancel it
+        (resource.data.generatorId == request.auth.uid && (
+          (resource.data.status == 'open' && request.resource.data.status == 'open') ||
+          (resource.data.status == 'open' && request.resource.data.status == 'cancelled' && onlyChanged(['status']))
+        )) ||
+        // Matched company transitions open -> matched
+        (resource.data.status == 'open'
+          && request.resource.data.status == 'matched'
+          && request.resource.data.matchedCompanyId == request.auth.uid
+          && onlyChanged(['status', 'matchedCompanyId'])) ||
+        // Matched company advances its own offer statuses
+        (resource.data.matchedCompanyId == request.auth.uid && (
+          (resource.data.status == 'matched'    && request.resource.data.status == 'scheduled' && onlyChanged(['status'])) ||
+          (resource.data.status == 'scheduled'  && request.resource.data.status == 'completed' && onlyChanged(['status'])) ||
+          (resource.data.status == 'scheduled'  && request.resource.data.status == 'disputed'  && onlyChanged(['status']))
+        ))
+      );
+    }
+
+    // ─── /matches ─────────────────────────────────────────────────────────────
+    match /matches/{matchId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.generatorId == request.auth.uid
+        && request.resource.data.status == 'proposed'
+        && request.resource.data.proposedAt == request.time;
+      allow update: if signedIn()
+        && onlyChanged(['status'])
+        && (
+          (request.auth.uid == resource.data.companyId
+            && request.resource.data.status in ['accepted', 'declined'])
+          || (request.auth.uid == resource.data.generatorId
+              && request.resource.data.status == 'expired'
+              && request.time >= resource.data.proposedAt + duration.value(24, 'h'))
+        );
+    }
+
+    // ─── /transactions ────────────────────────────────────────────────────────
+    match /transactions/{transactionId} {
+      allow read: if signedIn()
+        && (request.auth.uid == resource.data.generatorId
+            || request.auth.uid == resource.data.companyId);
+      allow create: if signedIn()
+        && (request.auth.uid == request.resource.data.generatorId
+            || request.auth.uid == request.resource.data.companyId)
+        && request.resource.data.status == 'pendingConfirmation';
+
+      allow update: if signedIn()
+        && txCoreUnchanged()
+        && (
+          (request.auth.uid == resource.data.generatorId && companyUnchanged())
+          || (request.auth.uid == resource.data.companyId && generatorUnchanged())
+        )
+        && (
+          request.resource.data.status == resource.data.status
+          || (request.resource.data.status == 'confirmed'
+              && resource.data.status == 'pendingConfirmation'
+              && checkTolerance(request.resource.data.generatorConfirmedWeight,
+                                request.resource.data.companyConfirmedWeight))
+          || (request.resource.data.status == 'disputed'
+              && resource.data.status == 'pendingConfirmation')
+        );
+    }
+
+    // ─── /disputes ────────────────────────────────────────────────────────────
+    match /disputes/{disputeId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.raisedBy == request.auth.uid;
+      allow update: if false; // Admin-only via console
+    }
+
+    // ─── /fraudFlags ──────────────────────────────────────────────────────────
+    match /fraudFlags/{flagId} {
+      allow read: if signedIn();
+      allow create: if signedIn();
+      allow update: if false; // Admin-only
+    }
+
+    // ─── /communityStats ──────────────────────────────────────────────────────
+    match /communityStats/{id} {
+      allow read: if true; // Public — visible on landing/dashboard without auth
+      allow write: if signedIn() && isValidStatsIncrement(id);
+    }
+
+    // ─── /pickupBatches ───────────────────────────────────────────────────────
+    match /pickupBatches/{batchId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.companyId == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.companyId == request.auth.uid
+        && onlyChanged(['status', 'actualPickupAt', 'driverNotes']);
+    }
+  }
+}
